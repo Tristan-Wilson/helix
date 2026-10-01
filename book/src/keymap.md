@@ -270,6 +270,8 @@ This layer is similar to Vim keybindings as Kakoune does not support windows.
 | `v`, `Ctrl-v`          | Vertical right split                                 | `vsplit`          |
 | `s`, `Ctrl-s`          | Horizontal bottom split                              | `hsplit`          |
 | `t`, `Ctrl-t`          | Transpose the two adjacent splits                    | `transpose_view`  |
+| `r`                    | Enter sticky window resize menu                     | N/A               |
+| `=`                    | Equalize all split sizes                            | `equalize_views`  |
 | `f`                    | Go to files/URLs in selections in horizontal splits  | `goto_file_hsplit`|
 | `F`                    | Go to files/URLs in selections in vertical splits    | `goto_file_vsplit`|
 | `h`, `Ctrl-h`, `Left`  | Move to left split                                   | `jump_view_left`  |
@@ -284,6 +286,29 @@ This layer is similar to Vim keybindings as Kakoune does not support windows.
 | `L`                    | Swap window to the right                             | `swap_view_right` |
 | `ns`, `nCtrl-s`        | New horizontal split with a scratch buffer           | `hsplit_new`      |
 | `nv`, `nCtrl-v`        | New vertical split with a scratch buffer             | `vsplit_new`      |
+
+Resize splits with `Ctrl-w r` or `Space w r`. This menu is sticky: keep pressing
+resize keys until `Escape` returns to normal window editing. A count sets the
+number of terminal cells to resize by (for example, `5l` grows the width by five
+columns); without a count, each command moves one cell.
+
+| Key | Description | Command |
+| --- | --- | --- |
+| `h`, `Left` | Shrink the focused view's width | `shrink_view_width` |
+| `l`, `Right` | Grow the focused view's width | `grow_view_width` |
+| `j`, `Down` | Shrink the focused view's height | `shrink_view_height` |
+| `k`, `Up` | Grow the focused view's height | `grow_view_height` |
+| `=` | Equalize all split sizes | `equalize_views` |
+
+Resizing moves the right or bottom divider when one exists, otherwise the left
+or top divider. For nested splits, the nearest ancestor split in that direction
+is resized, so panes sharing a divider move together. Neighbors give up space in
+order until they reach their minimum sizes (three columns and two rows per pane).
+When mouse support is enabled, drag a vertical separator or the statusline
+between horizontal splits to move that divider without changing focus.
+
+Split proportions survive terminal resizing. Extremely small terminals can clip
+panes below their minimum size; enlarging the terminal restores the proportions.
 
 #### Space mode
 

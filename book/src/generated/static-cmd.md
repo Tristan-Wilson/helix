@@ -240,6 +240,11 @@
 | `swap_view_up` | Swap with split above | normal: `` <C-w>K ``, `` <space>wK ``, select: `` <C-w>K ``, `` <space>wK `` |
 | `swap_view_down` | Swap with split below | normal: `` <C-w>J ``, `` <space>wJ ``, select: `` <C-w>J ``, `` <space>wJ `` |
 | `transpose_view` | Transpose splits | normal: `` <C-w>t ``, `` <space>wt ``, `` <C-w><C-t> ``, `` <space>w<C-t> ``, select: `` <C-w>t ``, `` <space>wt ``, `` <C-w><C-t> ``, `` <space>w<C-t> `` |
+| `grow_view_width` | Grow focused view width | normal: `` <C-w>rl ``, `` <space>wrl ``, `` <C-w>r<right> ``, `` <space>wr<right> ``, select: `` <C-w>rl ``, `` <space>wrl ``, `` <C-w>r<right> ``, `` <space>wr<right> `` |
+| `shrink_view_width` | Shrink focused view width | normal: `` <C-w>rh ``, `` <space>wrh ``, `` <C-w>r<left> ``, `` <space>wr<left> ``, select: `` <C-w>rh ``, `` <space>wrh ``, `` <C-w>r<left> ``, `` <space>wr<left> `` |
+| `grow_view_height` | Grow focused view height | normal: `` <C-w>rk ``, `` <C-w>r<up> ``, `` <space>wrk ``, `` <space>wr<up> ``, select: `` <C-w>rk ``, `` <C-w>r<up> ``, `` <space>wrk ``, `` <space>wr<up> `` |
+| `shrink_view_height` | Shrink focused view height | normal: `` <C-w>rj ``, `` <space>wrj ``, `` <C-w>r<down> ``, `` <space>wr<down> ``, select: `` <C-w>rj ``, `` <space>wrj ``, `` <C-w>r<down> ``, `` <space>wr<down> `` |
+| `equalize_views` | Equalize split sizes | normal: `` <C-w>= ``, `` <C-w>r= ``, `` <space>w= ``, `` <space>wr= ``, select: `` <C-w>= ``, `` <C-w>r= ``, `` <space>w= ``, `` <space>wr= `` |
 | `rotate_view` | Goto next window | normal: `` <C-w>w ``, `` <space>ww ``, `` <C-w><C-w> ``, `` <space>w<C-w> ``, select: `` <C-w>w ``, `` <space>ww ``, `` <C-w><C-w> ``, `` <space>w<C-w> `` |
 | `rotate_view_reverse` | Goto previous window |  |
 | `hsplit` | Horizontal bottom split | normal: `` <C-w>s ``, `` <space>ws ``, `` <C-w><C-s> ``, `` <space>w<C-s> ``, select: `` <C-w>s ``, `` <space>ws ``, `` <C-w><C-s> ``, `` <space>w<C-s> `` |

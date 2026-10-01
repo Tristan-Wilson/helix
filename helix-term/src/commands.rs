@@ -543,6 +543,11 @@ impl MappableCommand {
         swap_view_up, "Swap with split above",
         swap_view_down, "Swap with split below",
         transpose_view, "Transpose splits",
+        grow_view_width, "Grow focused view width",
+        shrink_view_width, "Shrink focused view width",
+        grow_view_height, "Grow focused view height",
+        shrink_view_height, "Shrink focused view height",
+        equalize_views, "Equalize split sizes",
         rotate_view, "Goto next window",
         rotate_view_reverse, "Goto previous window",
         hsplit, "Horizontal bottom split",
@@ -5971,6 +5976,32 @@ fn swap_view_down(cx: &mut Context) {
 
 fn transpose_view(cx: &mut Context) {
     cx.editor.transpose_view()
+}
+
+fn resize_view(cx: &mut Context, axis: tree::Layout, grow: bool) {
+    let cells = cx.count().min(u16::MAX as usize) as i32;
+    cx.editor
+        .resize_view(axis, if grow { cells } else { -cells });
+}
+
+fn grow_view_width(cx: &mut Context) {
+    resize_view(cx, tree::Layout::Vertical, true);
+}
+
+fn shrink_view_width(cx: &mut Context) {
+    resize_view(cx, tree::Layout::Vertical, false);
+}
+
+fn grow_view_height(cx: &mut Context) {
+    resize_view(cx, tree::Layout::Horizontal, true);
+}
+
+fn shrink_view_height(cx: &mut Context) {
+    resize_view(cx, tree::Layout::Horizontal, false);
+}
+
+fn equalize_views(cx: &mut Context) {
+    cx.editor.equalize_views();
 }
 
 /// Open a new split in the given direction specified by the action.

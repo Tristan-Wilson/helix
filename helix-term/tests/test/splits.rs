@@ -261,3 +261,220 @@ async fn test_reload_all_with_split_jumplist() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resize_keymaps_counts_and_sticky_mode() -> anyhow::Result<()> {
+    use std::cell::Cell;
+    let mut app = helpers::AppBuilder::new().build()?;
+    let original_width = Cell::new(0);
+    let original_height = Cell::new(0);
+    test_key_sequences(
+        &mut app,
+        vec![
+            (
+                Some("<C-w>v"),
+                Some(&|app| {
+                    original_width.set(app.editor.tree.get(app.editor.tree.focus).area.width);
+                }),
+            ),
+            (
+                Some("<C-w>r5l"),
+                Some(&|app| {
+                    assert_eq!(
+                        app.editor.tree.get(app.editor.tree.focus).area.width,
+                        original_width.get() + 5
+                    );
+                }),
+            ),
+            (
+                Some("hh"),
+                Some(&|app| {
+                    assert_eq!(
+                        app.editor.tree.get(app.editor.tree.focus).area.width,
+                        original_width.get() + 3
+                    );
+                }),
+            ),
+            (
+                Some("=<esc><C-w>s"),
+                Some(&|app| {
+                    assert_eq!(
+                        app.editor.tree.get(app.editor.tree.focus).area.width,
+                        original_width.get()
+                    );
+                    original_height.set(app.editor.tree.get(app.editor.tree.focus).area.height);
+                }),
+            ),
+            (
+                Some("<space>wr3<up><down>"),
+                Some(&|app| {
+                    assert_eq!(
+                        app.editor.tree.get(app.editor.tree.focus).area.height,
+                        original_height.get() + 2
+                    );
+                }),
+            ),
+            (
+                Some("<esc><space>w="),
+                Some(&|app| {
+                    assert_eq!(
+                        app.editor.tree.get(app.editor.tree.focus).area.height,
+                        original_height.get()
+                    );
+                }),
+            ),
+            (Some(":qa!<ret>"), None),
+        ],
+        true,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resize_mouse_drag_preserves_focus_and_selection() -> anyhow::Result<()> {
+    use helix_term::{
+        compositor::{Component, Context, Event},
+        job::Jobs,
+        keymap::Keymaps,
+        ui::EditorView,
+    };
+    use helix_view::{
+        editor::Action,
+        input::{MouseButton, MouseEvent, MouseEventKind},
+        keyboard::KeyModifiers,
+    };
+
+    let mut app = helpers::AppBuilder::new()
+        .with_input_text("hello #[world|]#")
+        .build()?;
+    let doc = app.editor.tree.get(app.editor.tree.focus).doc;
+    let first = app.editor.tree.focus;
+    app.editor.switch(doc, Action::VerticalSplit);
+    let second = app.editor.tree.focus;
+    let selection = app.editor.document(doc).unwrap().selection(second).clone();
+    let initial = app.editor.tree.get(first).area;
+    let mut ui = EditorView::new(Keymaps::new(Box::new(arc_swap::ArcSwap::from_pointee(
+        helix_term::keymap::default(),
+    ))));
+    let mut jobs = Jobs::new();
+    let mut event = |kind, column, row, editor: &mut helix_view::Editor| {
+        ui.handle_event(
+            &Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }),
+            &mut Context {
+                editor,
+                scroll: None,
+                jobs: &mut jobs,
+            },
+        );
+    };
+    event(
+        MouseEventKind::Down(MouseButton::Left),
+        initial.right(),
+        initial.y,
+        &mut app.editor,
+    );
+    event(
+        MouseEventKind::Drag(MouseButton::Left),
+        initial.right() + 8,
+        initial.y,
+        &mut app.editor,
+    );
+    assert_eq!(app.editor.tree.get(first).area.width, initial.width + 8);
+    assert_eq!(app.editor.tree.focus, second);
+    assert_eq!(
+        app.editor.document(doc).unwrap().selection(second),
+        &selection
+    );
+    // Releasing must clear capture even with middle-click paste disabled.
+    event(
+        MouseEventKind::Up(MouseButton::Left),
+        initial.right() + 8,
+        initial.y,
+        &mut app.editor,
+    );
+    event(
+        MouseEventKind::Drag(MouseButton::Left),
+        initial.right() + 12,
+        initial.y,
+        &mut app.editor,
+    );
+    assert_eq!(app.editor.tree.get(first).area.width, initial.width + 8);
+
+    app.editor.switch(doc, Action::HorizontalSplit);
+    let upper = second;
+    let lower = app.editor.tree.focus;
+    let area = app.editor.tree.get(upper).area;
+    event(
+        MouseEventKind::Down(MouseButton::Left),
+        area.x + 1,
+        area.bottom() - 1,
+        &mut app.editor,
+    );
+    event(
+        MouseEventKind::Drag(MouseButton::Left),
+        area.x + 1,
+        area.bottom() + 3,
+        &mut app.editor,
+    );
+    event(
+        MouseEventKind::Up(MouseButton::Left),
+        area.x + 1,
+        area.bottom() + 3,
+        &mut app.editor,
+    );
+    assert_eq!(app.editor.tree.get(upper).area.height, area.height + 4);
+    assert_eq!(app.editor.tree.focus, lower);
+    assert!(app.close().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn resize_tiny_terminal_renders_nested_splits() -> anyhow::Result<()> {
+    use helix_term::{
+        compositor::{Component, Context},
+        job::Jobs,
+        keymap::Keymaps,
+        ui::EditorView,
+    };
+    use helix_view::{editor::Action, graphics::Rect};
+    let mut app = helpers::AppBuilder::new()
+        .with_input_text("#[hello|]# world")
+        .build()?;
+    let doc = app.editor.tree.get(app.editor.tree.focus).doc;
+    for i in 0..25 {
+        app.editor.switch(
+            doc,
+            if i % 3 == 0 {
+                Action::HorizontalSplit
+            } else {
+                Action::VerticalSplit
+            },
+        );
+    }
+    let mut ui = EditorView::new(Keymaps::new(Box::new(arc_swap::ArcSwap::from_pointee(
+        helix_term::keymap::default(),
+    ))));
+    let mut jobs = Jobs::new();
+    for width in [1, 2, 5, 10, 80, 120] {
+        for height in [2, 3, 5, 40] {
+            let area = Rect::new(0, 0, width, height);
+            let mut surface = tui::buffer::Buffer::empty(area);
+            ui.render(
+                area,
+                &mut surface,
+                &mut Context {
+                    editor: &mut app.editor,
+                    scroll: None,
+                    jobs: &mut jobs,
+                },
+            );
+        }
+    }
+    assert!(app.close().await.is_empty());
+    Ok(())
+}

@@ -2318,11 +2318,31 @@ impl Editor {
     }
 
     pub fn swap_split_in_direction(&mut self, direction: tree::Direction) {
-        self.tree.swap_split_in_direction(direction);
+        if self.tree.swap_split_in_direction(direction).is_some() {
+            self._refresh();
+        }
     }
 
     pub fn transpose_view(&mut self) {
         self.tree.transpose();
+        self._refresh();
+    }
+
+    pub fn resize_view(&mut self, axis: tree::Layout, delta: i32) {
+        if self.tree.resize_view(axis, delta) {
+            self._refresh();
+        }
+    }
+
+    pub fn set_divider_position(&mut self, divider: tree::Divider, position: u16) {
+        if self.tree.set_divider_position(divider, position) {
+            self._refresh();
+        }
+    }
+
+    pub fn equalize_views(&mut self) {
+        self.tree.equalize();
+        self._refresh();
     }
 
     pub fn should_close(&self) -> bool {
