@@ -1,5 +1,9 @@
 use crate::{graphics::Rect, View, ViewId};
 use slotmap::SlotMap;
+use std::ops::{Index, IndexMut};
+
+const MIN_VIEW_WIDTH: u16 = 3;
+const MIN_VIEW_HEIGHT: u16 = 2;
 
 // the dimensions are recomputed on window resize/tree change.
 //
@@ -60,10 +64,90 @@ pub enum Direction {
     Right,
 }
 
+/// A divider between two adjacent slots. Generational IDs make stale mouse
+/// drags harmless when a split is closed, moved, or transposed.
+#[derive(Debug, Clone, Copy)]
+pub struct Divider {
+    container: ViewId,
+    before: ViewId,
+    after: ViewId,
+    layout: Layout,
+}
+
+impl Divider {
+    pub fn coordinate(self, column: u16, row: u16) -> u16 {
+        match self.layout {
+            Layout::Vertical => column,
+            Layout::Horizontal => row,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Child {
+    view: ViewId,
+    // Relative size requested by the user, independent of terminal size and
+    // temporary minimum-size constraints. Sizes belong to slots, not buffers.
+    weight: f64,
+}
+
+#[derive(Debug, Default)]
+struct Children(Vec<Child>);
+
+impl Children {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &ViewId> + ExactSizeIterator {
+        self.0.iter().map(|child| &child.view)
+    }
+
+    fn insert(&mut self, index: usize, view: ViewId) {
+        // New splits get an equal share; existing splits retain their ratios.
+        let weight = if self.is_empty() {
+            1.0
+        } else {
+            self.0.iter().map(|child| child.weight).sum::<f64>() / self.len() as f64
+        };
+        self.0.insert(index, Child { view, weight });
+    }
+
+    fn push(&mut self, view: ViewId) {
+        self.insert(self.len(), view);
+    }
+
+    fn pop(&mut self) -> Option<ViewId> {
+        self.0.pop().map(|child| child.view)
+    }
+
+    fn remove(&mut self, index: usize) {
+        self.0.remove(index);
+    }
+}
+
+impl Index<usize> for Children {
+    type Output = ViewId;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        &self.0[index].view
+    }
+}
+
+impl IndexMut<usize> for Children {
+    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
+        &mut self.0[index].view
+    }
+}
+
 #[derive(Debug)]
 pub struct Container {
     layout: Layout,
-    children: Vec<ViewId>,
+    children: Children,
     area: Rect,
 }
 
@@ -71,7 +155,7 @@ impl Container {
     pub fn new(layout: Layout) -> Self {
         Self {
             layout,
-            children: Vec::new(),
+            children: Children::default(),
             area: Rect::default(),
         }
     }
@@ -81,6 +165,68 @@ impl Default for Container {
     fn default() -> Self {
         Self::new(Layout::Vertical)
     }
+}
+
+/// Allocate whole cells, conserving the available space exactly. Minimum sizes
+/// constrain the rendered layout without overwriting the requested proportions.
+fn allocate(total: u16, weights: &[f64], minimums: &[u16]) -> Vec<u16> {
+    // Invalid sizing data must not leave holes in the layout.
+    let equal_weights;
+    let weights = if weights
+        .iter()
+        .any(|&weight| !weight.is_finite() || weight <= 0.0)
+        || !weights.iter().sum::<f64>().is_finite()
+    {
+        equal_weights = vec![1.0; weights.len()];
+        &equal_weights[..]
+    } else {
+        weights
+    };
+    let mut sizes = vec![0; weights.len()];
+    let mut fixed = vec![false; weights.len()];
+    let mut remaining = total;
+    let enforce_minimums =
+        minimums.iter().map(|&min| u64::from(min)).sum::<u64>() <= u64::from(total);
+    loop {
+        let weight_sum: f64 = weights
+            .iter()
+            .zip(&fixed)
+            .filter(|(_, fixed)| !**fixed)
+            .map(|(weight, _)| weight)
+            .sum();
+        if weight_sum == 0.0 {
+            break;
+        }
+        let mut constrained = false;
+        if enforce_minimums {
+            // Use the same remaining budget for every decision in this pass.
+            let budget = remaining;
+            for (i, &weight) in weights.iter().enumerate() {
+                if !fixed[i] && f64::from(budget) * weight / weight_sum < f64::from(minimums[i]) {
+                    sizes[i] = minimums[i];
+                    remaining -= sizes[i];
+                    fixed[i] = true;
+                    constrained = true;
+                }
+            }
+        }
+        if constrained {
+            continue;
+        }
+        let mut cumulative = 0.0;
+        let mut allocated = 0;
+        for (i, &weight) in weights.iter().enumerate() {
+            if fixed[i] {
+                continue;
+            }
+            cumulative += weight;
+            let next = (f64::from(remaining) * cumulative / weight_sum).round() as u16;
+            sizes[i] = next - allocated;
+            allocated = next;
+        }
+        break;
+    }
+    sizes
 }
 
 impl Tree {
@@ -368,77 +514,272 @@ impl Tree {
         // b) node is container, calculate areas for each child and push them on the stack
 
         while let Some((key, area)) = self.stack.pop() {
-            let node = &mut self.nodes[key];
+            let Content::Container(container) = &self.nodes[key].content else {
+                self.get_mut(key).area = area;
+                continue;
+            };
+            let layout = container.layout;
+            let children: Vec<_> = container.children.iter().copied().collect();
+            let weights: Vec<_> = container
+                .children
+                .0
+                .iter()
+                .map(|child| child.weight)
+                .collect();
+            let minimums: Vec<_> = children
+                .iter()
+                .map(|&child| self.minimum_size(child, layout))
+                .collect();
+            let length = match layout {
+                Layout::Vertical => area.width,
+                Layout::Horizontal => area.height,
+            };
+            let gaps = if layout == Layout::Vertical {
+                length.min(children.len().saturating_sub(1).min(u16::MAX as usize) as u16)
+            } else {
+                0
+            };
+            let sizes = allocate(length - gaps, &weights, &minimums);
+            self.container_mut(key).area = area;
+            let mut offset = 0;
+            for (i, (&child, size)) in children.iter().zip(sizes).enumerate() {
+                let child_area = match layout {
+                    Layout::Vertical => Rect::new(area.x + offset, area.y, size, area.height),
+                    Layout::Horizontal => Rect::new(area.x, area.y + offset, area.width, size),
+                };
+                self.stack.push((child, child_area));
+                offset += size + u16::from(i < gaps as usize);
+            }
+        }
+    }
 
-            match &mut node.content {
-                Content::View(view) => {
-                    // debug!!("setting view area {:?}", area);
-                    view.area = area;
-                } // TODO: call f()
-                Content::Container(container) => {
-                    // debug!!("setting container area {:?}", area);
-                    container.area = area;
+    fn node_area(&self, id: ViewId) -> Rect {
+        match &self.nodes[id].content {
+            Content::View(view) => view.area,
+            Content::Container(container) => container.area,
+        }
+    }
 
-                    match container.layout {
-                        Layout::Horizontal => {
-                            let len = container.children.len();
-
-                            let height = area.height / len as u16;
-
-                            let mut child_y = area.y;
-
-                            for (i, child) in container.children.iter().enumerate() {
-                                let mut area = Rect::new(
-                                    container.area.x,
-                                    child_y,
-                                    container.area.width,
-                                    height,
-                                );
-                                child_y += height;
-
-                                // last child takes the remaining width because we can get uneven
-                                // space from rounding
-                                if i == len - 1 {
-                                    area.height = container.area.y + container.area.height - area.y;
-                                }
-
-                                self.stack.push((*child, area));
-                            }
-                        }
-                        Layout::Vertical => {
-                            let len = container.children.len();
-                            let len_u16 = len as u16;
-
-                            let inner_gap = 1u16;
-                            let total_gap = inner_gap * len_u16.saturating_sub(2);
-
-                            let used_area = area.width.saturating_sub(total_gap);
-                            let width = used_area / len_u16;
-
-                            let mut child_x = area.x;
-
-                            for (i, child) in container.children.iter().enumerate() {
-                                let mut area = Rect::new(
-                                    child_x,
-                                    container.area.y,
-                                    width,
-                                    container.area.height,
-                                );
-                                child_x += width + inner_gap;
-
-                                // last child takes the remaining width because we can get uneven
-                                // space from rounding
-                                if i == len - 1 {
-                                    area.width = container.area.x + container.area.width - area.x;
-                                }
-
-                                self.stack.push((*child, area));
-                            }
-                        }
-                    }
+    // Include a statusline and one text row. Narrow views can clip their gutters;
+    // keeping this minimum small also permits compact reference panes.
+    fn minimum_size(&self, id: ViewId, axis: Layout) -> u16 {
+        match &self.nodes[id].content {
+            Content::View(_) => match axis {
+                Layout::Vertical => MIN_VIEW_WIDTH,
+                Layout::Horizontal => MIN_VIEW_HEIGHT,
+            },
+            Content::Container(container) => {
+                let sizes = container
+                    .children
+                    .iter()
+                    .map(|&child| self.minimum_size(child, axis));
+                if container.layout == axis {
+                    let gaps = if axis == Layout::Vertical {
+                        container
+                            .children
+                            .len()
+                            .saturating_sub(1)
+                            .min(u16::MAX as usize) as u16
+                    } else {
+                        0
+                    };
+                    sizes.fold(gaps, u16::saturating_add)
+                } else {
+                    sizes.max().unwrap_or(0)
                 }
             }
         }
+    }
+
+    fn divider(&self, container: ViewId, index: usize) -> Divider {
+        let Content::Container(node) = &self.nodes[container].content else {
+            unreachable!()
+        };
+        Divider {
+            container,
+            before: node.children[index],
+            after: node.children[index + 1],
+            layout: node.layout,
+        }
+    }
+
+    /// Find a vertical separator or a horizontal split's bottom statusline.
+    pub fn divider_at(&self, column: u16, row: u16) -> Option<Divider> {
+        // At a crossing, the visible vertical separator takes precedence over
+        // a statusline. Do not depend on the order of nodes in the slot map.
+        let mut horizontal = None;
+        for (id, node) in &self.nodes {
+            let Content::Container(container) = &node.content else {
+                continue;
+            };
+            if column < container.area.x
+                || column >= container.area.right()
+                || row < container.area.y
+                || row >= container.area.bottom()
+            {
+                continue;
+            }
+            for index in 0..container.children.len().saturating_sub(1) {
+                let before = self.node_area(container.children[index]);
+                let after = self.node_area(container.children[index + 1]);
+                let hit = match container.layout {
+                    Layout::Vertical => column == before.right() && column < after.x,
+                    Layout::Horizontal => before.height > 0 && row == before.bottom() - 1,
+                };
+                if hit {
+                    let divider = self.divider(id, index);
+                    if container.layout == Layout::Vertical {
+                        return Some(divider);
+                    }
+                    horizontal = Some(divider);
+                }
+            }
+        }
+        horizontal
+    }
+
+    /// Set a divider to an absolute terminal column/row. Space is taken from
+    /// neighboring slots in order, stopping at each subtree's minimum size.
+    /// Returns false for stale dividers or when no movement is possible.
+    pub fn set_divider_position(&mut self, divider: Divider, position: u16) -> bool {
+        let Some(Node {
+            content: Content::Container(container),
+            ..
+        }) = self.nodes.get(divider.container)
+        else {
+            return false;
+        };
+        if container.layout != divider.layout {
+            return false;
+        }
+        let Some(index) = container
+            .children
+            .0
+            .windows(2)
+            .position(|pair| pair[0].view == divider.before && pair[1].view == divider.after)
+        else {
+            return false;
+        };
+        let before = self.node_area(divider.before);
+        let current = match divider.layout {
+            Layout::Vertical => before.right(),
+            Layout::Horizontal => before.bottom().saturating_sub(1),
+        };
+        let delta = i32::from(position) - i32::from(current);
+        if delta == 0 {
+            return false;
+        }
+        let mut sizes: Vec<_> = container
+            .children
+            .iter()
+            .map(|&child| {
+                let area = self.node_area(child);
+                match divider.layout {
+                    Layout::Vertical => area.width,
+                    Layout::Horizontal => area.height,
+                }
+            })
+            .collect();
+        let minimums: Vec<_> = container
+            .children
+            .iter()
+            .map(|&child| self.minimum_size(child, divider.layout))
+            .collect();
+        // A terminal smaller than the combined minima is rendered safely, but
+        // cannot be manually resized until there is enough space again.
+        if sizes.iter().zip(&minimums).any(|(size, min)| size < min) {
+            return false;
+        }
+        let mut remaining = delta.unsigned_abs();
+        let recipient = if delta > 0 { index } else { index + 1 };
+        let donors: Box<dyn Iterator<Item = usize>> = if delta > 0 {
+            Box::new(index + 1..sizes.len())
+        } else {
+            Box::new((0..=index).rev())
+        };
+        for donor in donors {
+            let take = remaining.min(u32::from(sizes[donor] - minimums[donor])) as u16;
+            sizes[donor] -= take;
+            sizes[recipient] += take;
+            remaining -= u32::from(take);
+            if remaining == 0 {
+                break;
+            }
+        }
+        if remaining == delta.unsigned_abs() {
+            return false;
+        }
+        // Integer sizes become exact proportions of the current usable area.
+        for (child, size) in self
+            .container_mut(divider.container)
+            .children
+            .0
+            .iter_mut()
+            .zip(sizes)
+        {
+            child.weight = f64::from(size);
+        }
+        self.recalculate();
+        true
+    }
+
+    /// Grow/shrink the focused view along an axis by terminal cells. Prefer its
+    /// trailing divider; at the last slot use the preceding divider instead.
+    pub fn resize_view(&mut self, axis: Layout, delta: i32) -> bool {
+        let mut child = self.focus;
+        loop {
+            let parent = self.nodes[child].parent;
+            if parent == child {
+                return false;
+            }
+            let Content::Container(container) = &self.nodes[parent].content else {
+                unreachable!()
+            };
+            if container.layout == axis && container.children.len() > 1 {
+                // Shrinking a view stops at that view's minimum, even though a
+                // mouse drag can move the divider farther by shrinking peers.
+                let area = self.node_area(child);
+                let size = match axis {
+                    Layout::Vertical => area.width,
+                    Layout::Horizontal => area.height,
+                };
+                let available = size.saturating_sub(self.minimum_size(child, axis));
+                let delta = delta.max(-i32::from(available));
+                let index = container
+                    .children
+                    .iter()
+                    .position(|&id| id == child)
+                    .unwrap();
+                let (index, delta) = if index + 1 == container.children.len() {
+                    (index - 1, delta.saturating_neg())
+                } else {
+                    (index, delta)
+                };
+                let divider = self.divider(parent, index);
+                let before = self.node_area(divider.before);
+                let current = match axis {
+                    Layout::Vertical => before.right(),
+                    Layout::Horizontal => before.bottom().saturating_sub(1),
+                };
+                let position = i32::from(current)
+                    .saturating_add(delta)
+                    .clamp(0, i32::from(u16::MAX)) as u16;
+                return self.set_divider_position(divider, position);
+            }
+            child = parent;
+        }
+    }
+
+    /// Restore equal proportions throughout the split tree.
+    pub fn equalize(&mut self) {
+        for node in self.nodes.values_mut() {
+            if let Content::Container(container) = &mut node.content {
+                for child in &mut container.children.0 {
+                    child.weight = 1.0;
+                }
+            }
+        }
+        self.recalculate();
     }
 
     pub fn traverse(&self) -> Traverse<'_> {
@@ -494,7 +835,7 @@ impl Tree {
         }
     }
 
-    fn find_child(&self, id: ViewId, children: &[ViewId], direction: Direction) -> Option<ViewId> {
+    fn find_child(&self, id: ViewId, children: &Children, direction: Direction) -> Option<ViewId> {
         let mut child_id = match direction {
             // index wise in the child list the Up and Left represents a -1
             // thus reversed iterator.
@@ -728,6 +1069,283 @@ mod test {
     use crate::editor::GutterConfig;
     use crate::DocumentId;
 
+    fn new_view() -> View {
+        View::new(DocumentId::default(), GutterConfig::default())
+    }
+
+    fn split_tree(width: u16, height: u16, count: usize, layout: Layout) -> (Tree, Vec<ViewId>) {
+        let mut tree = Tree::new(Rect::new(0, 0, width, height));
+        let mut ids = vec![tree.insert(new_view())];
+        for _ in 1..count {
+            ids.push(tree.split(new_view(), layout));
+        }
+        (tree, ids)
+    }
+
+    fn areas(tree: &Tree) -> Vec<Rect> {
+        tree.traverse().map(|(_, view)| view.area).collect()
+    }
+
+    fn assert_within_parent(tree: &Tree) {
+        for (_, node) in &tree.nodes {
+            let Content::Container(container) = &node.content else {
+                continue;
+            };
+            let mut last_end = match container.layout {
+                Layout::Vertical => container.area.x,
+                Layout::Horizontal => container.area.y,
+            };
+            for &child in container.children.iter() {
+                let area = tree.node_area(child);
+                assert!(area.x >= container.area.x && area.right() <= container.area.right());
+                assert!(area.y >= container.area.y && area.bottom() <= container.area.bottom());
+                match container.layout {
+                    Layout::Vertical => {
+                        assert!(area.x >= last_end);
+                        assert_eq!(area.height, container.area.height);
+                        last_end = area.right();
+                    }
+                    Layout::Horizontal => {
+                        assert_eq!(area.y, last_end);
+                        assert_eq!(area.width, container.area.width);
+                        last_end = area.bottom();
+                    }
+                }
+            }
+            if !container.children.is_empty() {
+                assert_eq!(
+                    last_end,
+                    match container.layout {
+                        Layout::Vertical => container.area.right(),
+                        Layout::Horizontal => container.area.bottom(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn resize_exact_cells_and_equalize() {
+        for axis in [Layout::Vertical, Layout::Horizontal] {
+            let (mut tree, ids) = split_tree(121, 60, 3, axis);
+            let initial = areas(&tree);
+            tree.focus = ids[0];
+            assert!(tree.resize_view(axis, 1));
+            let before = initial[0];
+            let after = tree.get(ids[0]).area;
+            match axis {
+                Layout::Vertical => assert_eq!(after.width, before.width + 1),
+                Layout::Horizontal => assert_eq!(after.height, before.height + 1),
+            }
+            assert!(tree.resize_view(axis, -1));
+            assert_eq!(areas(&tree), initial);
+            tree.focus = ids[2];
+            assert!(tree.resize_view(axis, 7));
+            assert!(tree.resize_view(axis, -7));
+            assert_eq!(areas(&tree), initial);
+            tree.resize_view(axis, 13);
+            tree.equalize();
+            assert_eq!(areas(&tree), initial);
+        }
+    }
+
+    #[test]
+    fn resize_cascades_and_clamps_all_donors() {
+        let (mut tree, ids) = split_tree(180, 40, 4, Layout::Vertical);
+        tree.focus = ids[0];
+        assert!(tree.resize_view(Layout::Vertical, i32::MAX));
+        assert_eq!(tree.get(ids[0]).area.width, 168);
+        for &id in &ids[1..] {
+            assert_eq!(tree.get(id).area.width, MIN_VIEW_WIDTH);
+        }
+        assert!(!tree.resize_view(Layout::Vertical, 1));
+        assert_within_parent(&tree);
+        assert!(tree.resize_view(Layout::Vertical, i32::MIN));
+        assert_eq!(tree.get(ids[0]).area.width, MIN_VIEW_WIDTH);
+        assert_within_parent(&tree);
+    }
+
+    #[test]
+    fn shrinking_middle_view_does_not_shrink_earlier_views() {
+        let (mut tree, ids) = split_tree(180, 40, 4, Layout::Vertical);
+        let initial = areas(&tree);
+        tree.focus = ids[2];
+        assert!(tree.resize_view(Layout::Vertical, i32::MIN));
+        assert_eq!(tree.get(ids[0]).area, initial[0]);
+        assert_eq!(tree.get(ids[1]).area, initial[1]);
+        assert_eq!(tree.get(ids[2]).area.width, MIN_VIEW_WIDTH);
+        assert!(!tree.resize_view(Layout::Vertical, -1));
+        assert_within_parent(&tree);
+    }
+
+    quickcheck::quickcheck! {
+        fn arbitrary_layout_edits_remain_inside_parent(actions: Vec<u8>) -> bool {
+            let (mut tree, _) = split_tree(120, 40, 1, Layout::Vertical);
+            for (step, action) in actions.into_iter().take(100).enumerate() {
+                let axis = if action % 2 == 0 { Layout::Vertical } else { Layout::Horizontal };
+                match action % 8 {
+                    0 | 1 => { tree.split(new_view(), axis); }
+                    2 if tree.views().count() > 1 => tree.remove(tree.focus),
+                    3 => { tree.resize_view(axis, i32::from(action) - 128); }
+                    4 => { tree.resize(Rect::new(2, 3, u16::from(action), step as u16)); }
+                    5 => tree.transpose(),
+                    6 => tree.focus = tree.prev(),
+                    _ => tree.equalize(),
+                }
+                assert_within_parent(&tree);
+            }
+            true
+        }
+    }
+
+    #[test]
+    fn resize_respects_nested_minimums() {
+        let (mut tree, ids) = split_tree(100, 30, 2, Layout::Vertical);
+        tree.focus = ids[0];
+        let bottom_left = tree.split(new_view(), Layout::Horizontal);
+        let bottom_right = tree.split(new_view(), Layout::Vertical);
+        tree.focus = ids[1];
+        tree.resize_view(Layout::Vertical, 1000);
+        assert_eq!(tree.get(ids[0]).area.width, 7);
+        assert_eq!(tree.get(bottom_left).area.width, 3);
+        assert_eq!(tree.get(bottom_right).area.width, 3);
+        // Height changes find the horizontal ancestor, resizing the whole row.
+        tree.focus = bottom_right;
+        tree.resize_view(Layout::Horizontal, 1000);
+        assert_eq!(tree.get(ids[0]).area.height, 2);
+        assert_eq!(tree.get(bottom_left).area.height, 28);
+        assert_eq!(tree.get(bottom_right).area.height, 28);
+        assert_within_parent(&tree);
+    }
+
+    #[test]
+    fn tiny_terminal_preserves_requested_layout() {
+        let (mut tree, ids) = split_tree(180, 60, 4, Layout::Vertical);
+        tree.focus = ids[1];
+        tree.resize_view(Layout::Vertical, 80);
+        tree.split(new_view(), Layout::Horizontal);
+        tree.resize_view(Layout::Horizontal, 20);
+        let initial = areas(&tree);
+        for width in 0..15 {
+            for height in 0..8 {
+                tree.resize(Rect::new(2, 3, width, height));
+                assert_within_parent(&tree);
+            }
+        }
+        tree.resize(Rect::new(0, 0, 180, 60));
+        assert_eq!(areas(&tree), initial);
+        // More than twenty children is supported, even with too little space.
+        for _ in 0..30 {
+            tree.split(new_view(), Layout::Vertical);
+        }
+        for width in [0, 1, 10, 80, 180] {
+            tree.resize(Rect::new(0, 0, width, 20));
+            assert_within_parent(&tree);
+        }
+    }
+
+    #[test]
+    fn divider_hit_testing_and_absolute_drag() {
+        let (mut tree, ids) = split_tree(101, 30, 2, Layout::Vertical);
+        tree.resize(Rect::new(4, 7, 101, 30));
+        let divider = tree.divider_at(54, 10).unwrap();
+        assert!(tree.divider_at(53, 10).is_none());
+        assert!(tree.divider_at(105, 10).is_none());
+        assert!(tree.set_divider_position(divider, 60));
+        assert_eq!(tree.get(ids[0]).area.right(), 60);
+        tree.set_divider_position(divider, u16::MAX);
+        assert_eq!(tree.get(ids[1]).area.width, MIN_VIEW_WIDTH);
+        // Absolute positions don't accumulate drag errors after clamping.
+        tree.set_divider_position(divider, 59);
+        assert_eq!(tree.get(ids[0]).area.right(), 59);
+        tree.transpose();
+        assert!(!tree.set_divider_position(divider, 30));
+        let border_row = tree.get(ids[0]).area.bottom() - 1;
+        let divider = tree.divider_at(10, border_row).unwrap();
+        tree.set_divider_position(divider, 20);
+        assert_eq!(tree.get(ids[0]).area.bottom(), 21);
+        tree.remove(ids[0]);
+        assert!(!tree.set_divider_position(divider, 10));
+    }
+
+    #[test]
+    fn divider_crossings_prefer_vertical_separator() {
+        let (mut tree, ids) = split_tree(101, 30, 2, Layout::Horizontal);
+        tree.focus = ids[0];
+        tree.split(new_view(), Layout::Vertical);
+        let area = tree.get(ids[0]).area;
+        let divider = tree.divider_at(area.right(), area.bottom() - 1).unwrap();
+        assert_eq!(divider.layout, Layout::Vertical);
+        tree.set_divider_position(divider, area.right() + 10);
+        assert_eq!(tree.get(ids[0]).area.width, area.width + 10);
+        assert_eq!(tree.get(ids[0]).area.height, area.height);
+    }
+
+    #[test]
+    fn transpose_and_swap_preserve_slot_proportions() {
+        let (mut tree, ids) = split_tree(101, 100, 2, Layout::Vertical);
+        tree.focus = ids[0];
+        tree.resize_view(Layout::Vertical, 30);
+        let original = areas(&tree);
+        tree.transpose();
+        assert_eq!(tree.get(ids[0]).area.height, 80);
+        tree.transpose();
+        assert_eq!(areas(&tree), original);
+        tree.swap_split_in_direction(Direction::Right);
+        assert_eq!(tree.get(ids[1]).area, original[0]);
+        assert_eq!(tree.get(ids[0]).area, original[1]);
+        tree.recalculate();
+        assert_eq!(tree.get(ids[1]).area, original[0]);
+        assert_eq!(tree.get(ids[0]).area, original[1]);
+    }
+
+    #[test]
+    fn split_remove_and_collapse_preserve_proportions() {
+        let (mut tree, ids) = split_tree(121, 40, 2, Layout::Vertical);
+        tree.focus = ids[0];
+        tree.resize_view(Layout::Vertical, 20);
+        let initial = areas(&tree);
+        let nested = tree.split(new_view(), Layout::Horizontal);
+        tree.remove(nested);
+        assert_eq!(areas(&tree), initial);
+        tree.focus = ids[0];
+        let added = tree.split(new_view(), Layout::Vertical);
+        assert_within_parent(&tree);
+        tree.remove(added);
+        assert_eq!(areas(&tree), initial);
+        tree.remove(ids[0]);
+        assert_eq!(tree.get(ids[1]).area, tree.area());
+        tree.remove(ids[1]);
+        assert!(tree.is_empty());
+        assert!(!tree.resize_view(Layout::Vertical, 10));
+    }
+
+    #[test]
+    fn allocation_conserves_cells_and_honors_minimums() {
+        for total in 0..200 {
+            for weights in [
+                vec![1.0, 1.0, 1.0],
+                vec![1.0, 80.0, 3.0],
+                vec![10000.0, 1.0, 1.0],
+            ] {
+                let minimums = [3, 7, 11];
+                let sizes = allocate(total, &weights, &minimums);
+                assert_eq!(sizes.iter().sum::<u16>(), total);
+                if total >= 21 {
+                    assert!(sizes.iter().zip(minimums).all(|(&size, min)| size >= min));
+                }
+            }
+        }
+        for weights in [
+            [0.0, 0.0],
+            [f64::NAN, 1.0],
+            [-1.0, 2.0],
+            [f64::MAX, f64::MAX],
+        ] {
+            assert_eq!(allocate(101, &weights, &[3, 3]), vec![51, 50]);
+        }
+    }
+
     #[test]
     fn find_split_in_direction() {
         let mut tree = Tree::new(Rect {
@@ -927,9 +1545,7 @@ mod test {
         assert_eq!(3, tree.views().count());
         assert_eq!(
             vec![
-                tree_area_width / 3 - 1, // gap here
-                tree_area_width / 3 - 1, // gap here
-                tree_area_width / 3
+                59, 60, 59 // Both separators are excluded; distribute rounding across slots.
             ],
             tree.views()
                 .map(|(view, _)| view.area.width)
@@ -957,9 +1573,7 @@ mod test {
 
         assert_eq!(10, tree.views().count());
         assert_eq!(
-            std::iter::repeat_n(7, 9)
-                .chain(Some(8)) // Rounding in `recalculate`.
-                .collect::<Vec<_>>(),
+            vec![7, 7, 7, 7, 8, 7, 7, 7, 7, 7],
             tree.views()
                 .map(|(view, _)| view.area.width)
                 .collect::<Vec<_>>()

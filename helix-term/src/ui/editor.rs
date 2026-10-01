@@ -44,6 +44,8 @@ pub struct EditorView {
     spinners: ProgressSpinners,
     /// Tracks if the terminal window is focused by reaction to terminal focus events
     terminal_focused: bool,
+    /// The divider captured on mouse-down, retained when the pointer leaves it.
+    dragged_divider: Option<helix_view::tree::Divider>,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +69,7 @@ impl EditorView {
             completion: None,
             spinners: ProgressSpinners::default(),
             terminal_focused: true,
+            dragged_divider: None,
         }
     }
 
@@ -83,8 +86,46 @@ impl EditorView {
         surface: &mut Surface,
         is_focused: bool,
     ) {
-        let inner = view.inner_area(doc);
+        self.render_view_text(editor, doc, view, surface, is_focused);
         let area = view.area;
+        let theme = &editor.theme;
+        // if we're not at the edge of the screen, draw a right border
+        if viewport.right() != view.area.right() {
+            let x = area.right();
+            let border_style = theme.get("ui.window");
+            for y in area.top()..area.bottom() {
+                surface[(x, y)]
+                    .set_symbol(tui::symbols::line::VERTICAL)
+                    //.set_symbol(" ")
+                    .set_style(border_style);
+            }
+        }
+
+        let statusline_area = view
+            .area
+            .clip_top(view.area.height.saturating_sub(1))
+            .clip_bottom(1); // -1 from bottom to remove commandline
+
+        let mut context =
+            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
+
+        statusline::render(&mut context, statusline_area, surface);
+    }
+
+    fn render_view_text(
+        &self,
+        editor: &Editor,
+        doc: &Document,
+        view: &View,
+        surface: &mut Surface,
+        is_focused: bool,
+    ) {
+        let inner = view.inner_area(doc);
+        // A tiny terminal may leave only a statusline, or no text columns.
+        // Text decoration offsets are undefined for an empty text viewport.
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
         let theme = &editor.theme;
         let config = editor.config();
         let loader = editor.syn_loader.load();
@@ -217,33 +258,11 @@ impl EditorView {
             decorations,
         );
 
-        // if we're not at the edge of the screen, draw a right border
-        if viewport.right() != view.area.right() {
-            let x = area.right();
-            let border_style = theme.get("ui.window");
-            for y in area.top()..area.bottom() {
-                surface[(x, y)]
-                    .set_symbol(tui::symbols::line::VERTICAL)
-                    //.set_symbol(" ")
-                    .set_style(border_style);
-            }
-        }
-
         if config.inline_diagnostics.disabled()
             && config.end_of_line_diagnostics == DiagnosticFilter::Disable
         {
             Self::render_diagnostics(doc, view, inner, surface, theme);
         }
-
-        let statusline_area = view
-            .area
-            .clip_top(view.area.height.saturating_sub(1))
-            .clip_bottom(1); // -1 from bottom to remove commandline
-
-        let mut context =
-            statusline::RenderContext::new(editor, doc, view, is_focused, &self.spinners);
-
-        statusline::render(&mut context, statusline_area, surface);
     }
 
     pub fn render_rulers(
@@ -1217,6 +1236,36 @@ impl EditorView {
             ..
         } = *event;
 
+        if config.mouse {
+            match kind {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.dragged_divider = cxt.editor.tree.divider_at(column, row);
+                    if self.dragged_divider.is_some() {
+                        cxt.editor.mouse_down_range = None;
+                        return EventResult::Consumed(None);
+                    }
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    if let Some(divider) = self.dragged_divider {
+                        cxt.editor
+                            .set_divider_position(divider, divider.coordinate(column, row));
+                        return EventResult::Consumed(None);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(divider) = self.dragged_divider.take() {
+                        cxt.editor
+                            .set_divider_position(divider, divider.coordinate(column, row));
+                        return EventResult::Consumed(None);
+                    }
+                }
+                MouseEventKind::Down(_) => self.dragged_divider = None,
+                _ => {}
+            }
+        } else {
+            self.dragged_divider = None;
+        }
+
         let pos_and_view = |editor: &Editor, row, column, ignore_virtual_text| {
             editor.tree.views().find_map(|(view, _focus)| {
                 view.pos_at_screen_coords(
@@ -1482,11 +1531,13 @@ impl Component for EditorView {
                 EventResult::Consumed(None)
             }
             Event::Resize(_width, _height) => {
+                self.dragged_divider = None;
                 // Ignore this event, we handle resizing just before rendering to screen.
                 // Handling it here but not re-rendering will cause flashing
                 EventResult::Consumed(None)
             }
             Event::Key(mut key) => {
+                self.dragged_divider = None;
                 cx.editor.reset_idle_timer();
                 canonicalize_key(&mut key);
 
@@ -1598,6 +1649,7 @@ impl Component for EditorView {
                 EventResult::Consumed(None)
             }
             Event::FocusLost => {
+                self.dragged_divider = None;
                 if context.editor.config().auto_save.focus_lost {
                     let options = commands::WriteAllOptions {
                         force: false,
